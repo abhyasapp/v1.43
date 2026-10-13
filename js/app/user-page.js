@@ -5414,116 +5414,318 @@ window.HOURLY = {
       img.src = url;
     });
   },
-_loadPdfLib(){
+  _loadPdfLib(){
     if (window.PDFLib) return Promise.resolve(window.PDFLib);
-    if (this._pdfLibPromise) return this._pdfLibPromise;
-    const self = this;
-    this._pdfLibPromise = new Promise(function(resolve, reject){
-      const src = 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js';
+    return new Promise((res, rej) => {
       const s = document.createElement('script');
-      s.src = src;
-      s.async = true;
-      s.onload = function(){
-        if (window.PDFLib) resolve(window.PDFLib);
-        else { self._pdfLibPromise = null; reject(new Error('The PDF library did not initialise.')); }
-      };
-      s.onerror = function(){
-        self._pdfLibPromise = null;
-        reject(new Error('Could not load the PDF library. Check your connection and try again.'));
-      };
+      s.src = 'vendor/pdf-lib/pdf-lib.min.js';
+      s.onload  = () => window.PDFLib ? res(window.PDFLib) : rej(new Error('PDF tools did not load.'));
+      s.onerror = () => rej(new Error('Could not load the PDF tools.'));
       document.head.appendChild(s);
     });
-    return this._pdfLibPromise;
   },
-
   async _prepareUpload(files){
-    const MAX_BYTES = 8 * 1024 * 1024;
-    const list = Array.from(files || []);
-    if (!list.length) throw new Error('No file chosen.');
-
-    const isImage = f => /^image\//i.test(f.type || '') || /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/i.test(f.name || '');
-    const isPdf   = f => /pdf/i.test(f.type || '') || /\.pdf$/i.test(f.name || '');
-
-    const images = list.filter(isImage);
-    const pdfs   = list.filter(isPdf);
-
-    let dataUrl = '', filename = '', size = 0;
-
-    if (images.length && !pdfs.length){
-      const PDFLib = await this._loadPdfLib();
-      const doc = await PDFLib.PDFDocument.create();
-      for (const img of images){
-        const jpeg = await this._imageToJpeg(img, 1600, 0.82);
-        const embedded = await doc.embedJpg(jpeg.bytes);
-        const page = doc.addPage([embedded.width, embedded.height]);
-        page.drawImage(embedded, { x: 0, y: 0, width: embedded.width, height: embedded.height });
-      }
-      const bytes = await doc.save();
-      if (bytes.length > MAX_BYTES) throw new Error('Combined file is over 8 MB — try fewer or smaller photos.');
-      const blob = new Blob([bytes], { type: 'application/pdf' });
-      dataUrl  = await this._readAsDataUrl(blob);
-      filename = 'answer-' + Date.now() + '.pdf';
-      size     = bytes.length;
-    } else if (pdfs.length === 1){
-      const f = pdfs[0];
-      if (f.size > MAX_BYTES) throw new Error('That PDF is over 8 MB — try a smaller one.');
-      dataUrl  = await this._readAsDataUrl(f);
-      filename = f.name || ('answer-' + Date.now() + '.pdf');
-      size     = f.size || 0;
-    } else if (pdfs.length > 1){
-      throw new Error('Upload a single PDF, or page photos — not multiple PDFs.');
-    } else {
-      throw new Error('Choose photos of your answer, or one PDF.');
+    const isPdf = f => /pdf/i.test(f.type || '') || /\.pdf$/i.test(f.name);
+    const isImg = f => /^image\//i.test(f.type || '');
+    if (files.length === 1 && isPdf(files[0])){
+      const f = files[0];
+      if (f.size > 8 * 1024 * 1024) throw new Error('PDF too large (max 8 MB).');
+      return { dataUrl: await this._readAsDataUrl(f), filename: f.name, size: f.size };
     }
-
-    if (!dataUrl) throw new Error('Could not read that file.');
-    return { dataUrl, filename, size };
+    if (!files.every(isImg)) throw new Error('Choose one PDF, or one or more photos.');
+    if (files.length > 20)   throw new Error('Up to 20 photos at a time.');
+    const lib = await this._loadPdfLib();
+    const doc = await lib.PDFDocument.create();
+    for (const f of files){
+      const j   = await this._imageToJpeg(f, 1800, 0.78);
+      const emb = await doc.embedJpg(j.bytes);
+      const p   = doc.addPage([j.w, j.h]);
+      p.drawImage(emb, { x: 0, y: 0, width: j.w, height: j.h });
+    }
+    const out = await doc.save();
+    if (out.length > 8 * 1024 * 1024) throw new Error('Those photos are too large together.');
+    let bin = '';
+    for (let i = 0; i < out.length; i += 0x8000) bin += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
+    return { dataUrl: 'data:application/pdf;base64,' + btoa(bin), filename: 'hourly-' + Date.now() + '.pdf', size: out.length };
   },
 
+  // ── diagnostics / escape hatches ────────────────────────────────────
+  async diagnose(){
+    const lv = this.level;
+    let online = false, forced = false, hasUser = false, hasToken = false, user = null;
+    try {
+      online = !!S.online; forced = !!S.forcedOffline;
+      user = (S && S.user) || null;
+      hasUser  = !!(user && user.username);
+      hasToken = !!(user && user.token);
+    } catch(e){}
+
+    const refs = (typeof ChapterData !== 'undefined' ? ChapterData.allFileRefs() : []).filter(r => r.lv === lv);
+
+    console.log('── HOURLY diagnose ──');
+    console.log('level             :', lv);
+    console.log('S.online          :', online);
+    console.log('S.forcedOffline   :', forced);
+    console.log('navigator.onLine  :', (typeof navigator !== 'undefined' ? navigator.onLine : '?'));
+    console.log('user / token      :', hasUser, '/', hasToken);
+    console.log('refs for level    :', refs.length);
+    if (!refs.length){ console.warn('No refs found for this level.'); return; }
+
+    let keys = new Set();
+    try { if (typeof QDB !== 'undefined') keys = new Set(await QDB.keys()); } catch(e){}
+    console.log('QDB cached keys   :', keys.size);
+
+    const canNet = online && !forced;
+    for (let i = 0; i < Math.min(5, refs.length); i++){
+      const ref = refs[i];
+      const cached = keys.has(ref.key);
+      console.log(`  [${i+1}] key=${ref.key}  fid=${String(ref.fid).slice(0,12)}…  cached=${cached}`);
+      if (cached){
+        try {
+          const c = await QDB.get(ref.key);
+          const n = normQ(c, ref.fid).length;
+          console.log(`       → ${n} questions in cache`);
+        } catch(e){ console.warn('       → cache read failed', e); }
+      } else if (canNet){
+        try {
+          const raw = await QUIZ._fetch(ref.fid, ref.key);
+          console.log(`       → network fetch OK, ${normQ(raw, ref.fid).length} questions`);
+        } catch(e){
+          console.warn('       → network fetch FAILED —', e && e.message);
+        }
+      } else {
+        console.log('       → skipped (offline + not cached)');
+      }
+    }
+    console.log('── end diagnose ──');
+    console.log('Tip: run HOURLY.resetHour() if you got stuck mid-attempt.');
+  },
+
+  resetHour(){
+    this._setObj(null);
+    this._setSubj(null);
+    this._pendingFile = null;
+    this._pick = null;
+    try { toast('This hour\'s hourly state has been cleared.'); } catch(e){}
+    try { if (typeof UI !== 'undefined' && UI.cur === 'hourly') this.render(); } catch(e){}
+  },
+
+  // ── badge + hint ─────────────────────────────────────────────────────
   _refreshBadge(){
-    const badge = document.getElementById('hourly-badge');
-    if (!badge) return;
-    let n = 0;
-    const subj = this._getSubj();
-    if (subj && !subj.submitted) n++;
-    const obj  = this._getObj();
-    const key  = this._hourKey() + '|' + this.level;
-    if (obj && obj.key === key && !obj.submitted) n++;
-    if (n > 0){
-      badge.textContent = String(n);
-      badge.style.display = '';
-    } else {
-      badge.textContent = '';
-      badge.style.display = 'none';
+    const b = document.getElementById('hourly-badge');
+    const h = document.getElementById('hourly-hint');
+    const lv = this.level;
+    const objSt   = this._getObj();
+    const subSt   = this._getSubj();
+    const objDone = !!(objSt && objSt.key === (this._hourKey() + '|' + lv) && objSt.submitted);
+    const subjDone = !!(subSt && subSt.submitted);
+    if (b) b.hidden = objDone && subjDone;
+    if (h){
+      if (subSt && !subSt.submitted)        h.textContent = 'Written in progress';
+      else if (!subjDone && !objDone)       h.textContent = 'New this hour';
+      else if (subjDone && objDone)         h.textContent = 'Both done';
+      else if (subjDone)                    h.textContent = 'Written done · sprint open';
+      else                                  h.textContent = 'Sprint done · written open';
     }
   }
 };
 
-/* ═══════════════════════════════════════════════════════════════════════
-   HOURLY — mount / unmount when the Hourly view enters or leaves.
-   ═══════════════════════════════════════════════════════════════════════ */
-(function bootstrapHourly(){
-  function go(){
-    if (typeof UI === 'undefined' || !UI.cur) return;
-    try {
-      if (UI.cur === 'hourly') HOURLY.mount();
-      else HOURLY.unmount();
-    } catch(e){}
-  }
-  // First paint, then follow view changes.
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(go, 500));
-  else setTimeout(go, 500);
+/* ══ HOURLY wiring ══════════════════════════════════════════════════ */
+(function(){
+  // Route UI.go('hourly') into HOURLY.mount(); tear the timers down on every other screen.
+  UI.onEnter('hourly', () => setTimeout(() => { try { HOURLY.mount(); } catch(e){} }, 30));
+  UI.onEnterAny(v => { if (v !== 'hourly') { try { HOURLY.unmount(); } catch(e){} } });
 
-  if (typeof UI !== 'undefined' && typeof UI.set === 'function' && !UI._hourlyWrapped){
-    const orig = UI.set.bind(UI);
-    UI.set = function(view){
-      const r = orig(view);
-      try {
-        if (view === 'hourly') HOURLY.mount();
-        else HOURLY.unmount();
-      } catch(e){}
-      return r;
-    };
-    UI._hourlyWrapped = true;
-  }
+  // Honour scope.timeLimitSec on exam start (default is 90s per question,
+  // which would be 75 minutes for a 50-question sprint — we want 60).
+  const _prevDoStart = QUIZ._doStart.bind(QUIZ);
+  QUIZ._doStart = function(qsArr, mode, chapterName, doShuffle, scope){
+    _prevDoStart(qsArr, mode, chapterName, doShuffle, scope);
+    if (scope && scope.timeLimitSec && S.quiz && S.quiz.mode === 'exam'){
+      S.quiz.left      = scope.timeLimitSec;
+      S.quiz.examEndAt = Date.now() + scope.timeLimitSec * 1000;
+      const tEl = document.getElementById('ex-tmr');
+      if (tEl) tEl.textContent = fmt(S.quiz.left);
+      if (typeof QUIZ._snapshotExam === 'function') QUIZ._snapshotExam(true);
+    }
+  };
+
+  // Record the sprint result the moment the results card is shown.
+  const _prevShowResults = QUIZ._showResults.bind(QUIZ);
+  QUIZ._showResults = function(){
+    _prevShowResults();
+    try {
+      const scope = S.quiz && S.quiz.scope;
+      if (scope && scope.hourlySprint && typeof HOURLY !== 'undefined'){
+        const total = S.quiz.qs.length;
+        let correct = 0;
+        S.quiz.qs.forEach((q, i) => { if (isOk(S.quiz.ans[i], q.correct)) correct++; });
+        const pct = total ? Math.round((correct / total) * 100) : 0;
+        HOURLY._recordObjResult(correct, total, pct);
+      }
+    } catch(e){}
+  };
+
+  // Keep the sidebar hint and badge fresh even when HOURLY isn't mounted.
+  setTimeout(() => { try { HOURLY._refreshBadge(); } catch(e){} }, 1500);
+  setInterval(() => { try { HOURLY._refreshBadge(); } catch(e){} }, 5000);
 })();
+
+/* ═══════════════════════════════════════════════════════════════════════
+   v1.22 additions — live Loksewa score, QSEARCH invalidation, filter reset
+   ═══════════════════════════════════════════════════════════════════════ */
+(function v122(){
+
+  /* ── 1. Invalidate the QSEARCH index whenever the question cache changes.
+     Otherwise a chapter downloaded after QSEARCH ran is invisible to
+     search until the page reloads. */
+  (function wireCacheInvalidation(){
+    if (typeof QDB === 'undefined' || !QDB.set) return;
+    const drop = () => { try { if (typeof QSEARCH !== 'undefined' && QSEARCH._index) QSEARCH._index = null; } catch(e){} };
+    const origSet = QDB.set.bind(QDB);
+    const origDel = QDB.del ? QDB.del.bind(QDB) : null;
+    const origClear = QDB.clear ? QDB.clear.bind(QDB) : null;
+    QDB.set = async function(k, v){ const r = await origSet(k, v); drop(); return r; };
+    if (origDel)   QDB.del = async function(k){ const r = await origDel(k); drop(); return r; };
+    if (origClear) QDB.clear = async function(){ const r = await origClear(); drop(); return r; };
+  })();
+
+  /* ── 2. (removed in v1.32) Live Loksewa score in the exam bar.
+     It showed a running score while the exam was in progress, so a student
+     could watch it move after each answer and learn which ones were right.
+     Marks, with negative marking, now appear only on the result page. */
+
+  /* ── 3. REV filter persistence ──
+     v1.27 moved this into objective.js itself (REV._loadFilters / _saveFilters),
+     where the filters live. Nothing to do here. */
+
+})();
+
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PERF — v1.32. Must stay the LAST thing in the last script.
+   HOME.render and HOME.updateBadges were being called dozens of times in a
+   burst (submitting a 75-question exam called updateBadges 117 times). The
+   first call still runs immediately; the rest of that frame collapse into one.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function hookInsights(){
+  try {
+    if (typeof PROG === 'undefined' || typeof PROG.render !== 'function' || PROG.render.__ins) return;
+    const base = PROG.render.bind(PROG);
+    PROG.render = function(){ const r = base.apply(this, arguments); try { INSIGHTS.render(); } catch (e) { console.error(e); } return r; };
+    PROG.render.__ins = true;
+  } catch (e) { console.error('insights hook skipped:', e); }
+})();
+
+(function coalesceHomeRenders(){
+  try {
+    if (typeof HOME === 'undefined' || typeof frameThrottle !== 'function') return;
+    ['render', 'updateBadges'].forEach(function(k){
+      if (typeof HOME[k] === 'function' && !HOME[k].__throttled) {
+        const t = frameThrottle(HOME[k].bind(HOME));
+        t.__throttled = true;
+        HOME[k] = t;
+      }
+    });
+  } catch (e) { console.error('perf coalescing skipped:', e); }
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PROGRESS TABS — self-contained switcher.
+
+   The tab bar's onclick calls PROG.tab() in app.js. When PROG.tab does not
+   switch panels, or switches them but does not render their contents, the
+   tabs feel dead. HEATMAP and SERVER_PROG both live in this file, so the
+   wiring belongs here too.
+
+   Runs alongside PROG.tab: its own behaviour still runs first, this is
+   idempotent on top of it.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function progressTabs(){
+  const TABS = ['accuracy', 'heatmap', 'coverage'];
+  const bar  = document.getElementById('prog-tabs');
+  if (!bar) return;
+
+  function show(name){
+    if (TABS.indexOf(name) === -1) name = 'accuracy';
+
+    /* 1. Buttons */
+    bar.querySelectorAll('button').forEach(b => {
+      const on = b.dataset.tab === name;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+
+    /* 2. Panels */
+    TABS.forEach(t => {
+      const el = document.getElementById('prog-tab-' + t);
+      if (el) el.hidden = (t !== name);
+    });
+
+    /* 3. Paint the visible panel's content */
+    try {
+      if (name === 'heatmap'  && typeof HEATMAP !== 'undefined')      HEATMAP.render();
+      if (name === 'coverage' && typeof SERVER_PROG !== 'undefined')  SERVER_PROG.load(false);
+      if (name === 'accuracy') {
+        if (typeof PROG !== 'undefined' && typeof PROG.render === 'function') PROG.render();
+        if (typeof INSIGHTS !== 'undefined') INSIGHTS.render();
+      }
+    } catch (e) { console.warn('[progress tabs] render failed:', e); }
+  }
+
+  bar.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => setTimeout(() => show(btn.dataset.tab), 0));
+  });
+
+  try {
+    if (typeof PROG !== 'undefined' && typeof PROG.tab === 'function' && !PROG.tab.__wired) {
+      const orig = PROG.tab.bind(PROG);
+      PROG.tab = function(name){
+        const r = orig(name);
+        try { setTimeout(() => show(name), 0); } catch (e) {}
+        return r;
+      };
+      PROG.tab.__wired = true;
+    }
+  } catch (e) {}
+
+  if (typeof UI !== 'undefined' && typeof UI.onEnter === 'function') {
+    UI.onEnter('progress', () => {
+      setTimeout(() => {
+        const active = bar.querySelector('button.active');
+        show((active && active.dataset.tab) || 'accuracy');
+      }, 80);
+    });
+  }
+
+  let tries = 0;
+  (function settle(){
+    const ready = typeof HEATMAP !== 'undefined' && typeof SERVER_PROG !== 'undefined';
+    if (!ready && ++tries < 20) return setTimeout(settle, 250);
+    const active = bar.querySelector('button.active');
+    show((active && active.dataset.tab) || 'accuracy');
+  })();
+})();
+
+/* "Share my progress" (Progress tab > Your tools). v1.38: the button existed but SHARECARD was never defined, so it did
+   nothing. Shares a short text summary with the phone's share sheet, or copies it when sharing is not available.
+   Only totals are shared: no name, no question text. */
+const SHARECARD = {
+  text(){
+    const p = S.prog || {}, total = Number(p.total) || 0, correct = Number(p.correct) || 0;
+    const pct = total ? Math.round(correct * 100 / total) : 0;
+    const days = new Set(((S.stk && S.stk.days) || []).map(String)).size;
+    return total
+      ? `I have practised ${total} questions on Abhyas with ${pct}% accuracy` + (days ? ` over ${days} study days` : '') + '. Loksewa preparation, one day at a time.'
+      : 'I have started my Loksewa preparation on Abhyas.';
+  },
+  async run(){
+    const text = SHARECARD.text();
+    try {
+      if(navigator.share){ await navigator.share({ text }); return; }
+    } catch(e){ if(e && e.name === 'AbortError') return; }
+    try { await navigator.clipboard.writeText(text); toast('Copied. Paste it in a message to share.'); }
+    catch(e){ toast('Could not share here. Your summary: ' + text, 8000); }
+  }
+};
