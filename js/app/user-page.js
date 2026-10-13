@@ -5414,10 +5414,7 @@ window.HOURLY = {
       img.src = url;
     });
   },
-  _loadPdfLib(){
-    if (window.PDFLib) return Promise.resolve(window.PDFLib);
-    return new Promise
-      _loadPdfLib(){
+_loadPdfLib(){
     if (window.PDFLib) return Promise.resolve(window.PDFLib);
     if (this._pdfLibPromise) return this._pdfLibPromise;
     const self = this;
